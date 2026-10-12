@@ -1,0 +1,359 @@
+---
+title: "Data quality issues: SCOREs Hurst and Kavanagh (2016) replication"
+format: html
+embed-resources: true
+---
+
+```{r}
+#install.packages("ppcor")
+library(ppcor)
+library(tidyverse)
+library(ggpubr)
+```
+
+```{r}
+original_data <- read.csv("1-s2.0-S1090513816301118-mmc1.csv")
+replication_data <- read.csv("Raw_Data_Complete.csv", sep = ";")
+
+knitr::opts_chunk$set(dev = "svglite", fig.width = 7, fig.height = 6)
+plot_font <- "Helvetica Neue LT Std 57 Condensed"
+sysfonts::font_add(
+  family = plot_font,
+  regular = "Helvetica Neue LT Std 57 Condensed.otf"
+)
+showtext::showtext_auto()
+study_palette <- c(Original = "#00AFBB", Replication = "#E7B800")
+publication_theme <- theme_classic(base_size = 13, base_family = plot_font) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.line = element_line(linewidth = 0.35),
+    axis.ticks = element_line(linewidth = 0.35),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 13),
+    legend.key.height = unit(13, "pt"),
+    legend.key.width = unit(18, "pt"),
+    legend.margin = margin(0, 0, 6, 0),
+    plot.title = element_text(size = 14, face = "plain"),
+    plot.caption = element_text(size = 9, hjust = 0, margin = margin(t = 4)),
+    plot.margin = margin(8, 8, 8, 8)
+  )
+dir.create("figures", showWarnings = FALSE)
+```
+
+# Replication scale scoring
+
+| Raw items | Scale | Scoring and direction |
+|---|---|---|
+| Q15_1–Q15_9 | Adolescent Attachment Questionnaire (AAQ) | Reverse 4–9 with `6 - x`; sum. Higher = poorer attachment (9–45). |
+| Q16_1–Q16_23 | DSM-5 Level 1 Cross-Cutting Symptom Measure—Adult | Subtract 1 from each item; sum. Higher = more symptoms (0–92). |
+| Q17_1–Q17_29 | Buss–Perry Aggression Questionnaire | Reverse 7 and 18 with `6 - x`; sum. Higher = more aggression (29–145). |
+| Q18_1–Q18_20 | Mini-K | Subtract 3 from each item; sum. Higher = slower life-history strategy (−40–40). |
+| Q19_1–Q19_22 | High-K Strategy Scale (HKSS) | Sum without reversing. Higher = higher-K/slower strategy (22–110). |
+| Seventeen self-harm behaviours and their frequency follow-ups | Deliberate Self-Harm Inventory (DSHI) | Sum valid reported occurrence counts; see the missing-data rules below. |
+
+
+```{r}
+replication_included <- replication_data %>%
+  filter(ResponseId != "R_e4KcPgvKpQpamWd")
+
+# Separate scored item data so that the raw Q variables remain unchanged.
+replication_items <- replication_included %>%
+  mutate(
+    across(all_of(paste0("Q15_", 4:9)), ~ 6 - .x),
+    across(all_of(paste0("Q16_", 1:23)), ~ .x - 1),
+    across(all_of(paste0("Q17_", c(7, 18))), ~ 6 - .x),
+    across(all_of(paste0("Q18_", 1:20)), ~ .x - 3)
+  )
+
+# A missing item produces a missing total; no prorating or partial sums.
+replication_scales <- replication_items %>%
+  transmute(
+    ResponseId,
+    Age = 2020 - Q2,
+    AAQ_Angry = rowSums(across(all_of(paste0("Q15_", 1:3)))),
+    AAQ_Avail = rowSums(across(all_of(paste0("Q15_", 4:6)))),
+    AAQ_Goal = rowSums(across(all_of(paste0("Q15_", 7:9)))),
+    Attach_Total = rowSums(across(all_of(paste0("Q15_", 1:9)))),
+    AQ_Physical = rowSums(across(all_of(paste0("Q17_", 1:9)))),
+    AQ_Verbal = rowSums(across(all_of(paste0("Q17_", 10:14)))),
+    AQ_Anger = rowSums(across(all_of(paste0("Q17_", 15:21)))),
+    AQ_Hostility = rowSums(across(all_of(paste0("Q17_", 22:29)))),
+    # Preserve the original dataset's spelling for comparisons.
+    Aggresion_Total = rowSums(across(all_of(paste0("Q17_", 1:29)))),
+    DSM5_Total = rowSums(across(all_of(paste0("Q16_", 1:23)))),
+    MiniK_Total = rowSums(across(all_of(paste0("Q18_", 1:20)))),
+    HKSS_Total = rowSums(across(all_of(paste0("Q19_", 1:22))))
+  )
+```
+
+
+## Self-harm frequencies
+
+```{r}
+self_harm_key <- tribble(
+  ~behaviour,                  ~screen_item, ~frequency_item,
+  "Cutting",                   "Q20",        "Q22",
+  "Burning with cigarette",    "Q29",        "Q122",
+  "Burning with lighter",      "Q120",       "Q63",
+  "Carving words",             "Q30",        "Q64",
+  "Biting",                    "Q31",        "Q65",
+  "Carving pictures",          "Q32",        "Q66",
+  "Severe scratching",         "Q33",        "Q67",
+  "Rubbing sandpaper",         "Q34",        "Q68",
+  "Dripping acid",             "Q35",        "Q69",
+  "Using cleaning chemicals",  "Q36",        "Q70",
+  "Sticking sharp objects",    "Q40",        "Q71",
+  "Rubbing glass",             "Q37",        "Q72",
+  "Breaking bones",            "Q38",        "Q73",
+  "Banging head",              "Q39",        "Q74",
+  "Punching self",             "Q126",       "Q128",
+  "Preventing wound healing",  "Q41",        "Q75",
+  "Other self-harm",           "Q42",        "Q76"
+)
+
+self_harm_items <- pmap_dfr(
+  self_harm_key,
+  function(behaviour, screen_item, frequency_item) {
+    tibble(
+      ResponseId = replication_included$ResponseId,
+      behaviour = behaviour,
+      screen_item = screen_item,
+      frequency_item = frequency_item,
+      endorsed_raw = replication_included[[.env$screen_item]],
+      frequency_raw = as.character(replication_included[[.env$frequency_item]])
+    )
+  }
+) %>%
+  mutate(
+    frequency_text = trimws(frequency_raw),
+    blank = is.na(frequency_text) | frequency_text == "",
+    # Strict conversion: do not extract numbers from ambiguous free text.
+    frequency_numeric = suppressWarnings(as.numeric(frequency_text)),
+    issue = case_when(
+      is.na(endorsed_raw) | !(endorsed_raw %in% c(1, 2)) ~
+        "Missing or invalid yes/no response",
+      endorsed_raw == 2 & blank ~ NA_character_,
+      blank ~ "Yes, but no frequency supplied",
+      !is.finite(frequency_numeric) ~ "Non-numeric or non-finite frequency",
+      frequency_numeric < 0 ~ "Negative frequency",
+      frequency_numeric != floor(frequency_numeric) ~ "Fractional count",
+      endorsed_raw == 1 & frequency_numeric == 0 ~ "Yes, but zero frequency",
+      endorsed_raw == 2 & frequency_numeric > 0 ~ "No, but positive frequency",
+      TRUE ~ NA_character_
+    ),
+    frequency_scored = case_when(
+      !is.na(issue) ~ NA_real_,
+      endorsed_raw == 2 ~ 0,
+      TRUE ~ frequency_numeric
+    ),
+    endorsed = case_when(
+      endorsed_raw == 1 ~ 1L,
+      endorsed_raw == 2 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+self_harm_issues <- self_harm_items %>%
+  filter(!is.na(issue)) %>%
+  select(ResponseId, behaviour, screen_item, frequency_item,
+         endorsed_raw, frequency_raw, issue)
+
+self_harm_scores <- self_harm_items %>%
+  group_by(ResponseId) %>%
+  summarise(
+    SH_Total = sum(frequency_scored),
+    # Additional descriptive count, distinct from the paper's frequency total.
+    SH_Behaviour_Count = sum(endorsed),
+    SH_Frequency_Issues = sum(!is.na(issue)),
+    .groups = "drop"
+  )
+
+replication_scored <- replication_included %>%
+  left_join(replication_scales, by = "ResponseId") %>%
+  left_join(self_harm_scores, by = "ResponseId") %>%
+  mutate(
+    Psychopathology_Index = DSM5_Total,
+    Mini_K_Total_Score = MiniK_Total
+  )
+
+self_harm_issues
+```
+
+
+# Reproductions
+
+Original paper:
+
+```{r}
+original_data %>%
+    select(Age, MiniK_Total, DSM5_Total) %>%
+    pcor(., method = "pearson")
+```
+
+Replication:
+
+```{r}
+replication_scored %>%
+  select(Age, MiniK_Total, DSM5_Total) %>%
+  pcor(., method = "pearson")
+```
+
+
+```{r}
+focal_scores <- bind_rows(
+  Original = original_data %>%
+    transmute(MiniK_Total, DSM5_Total = DSM5_Total - 23),
+  Replication = replication_scored %>%
+    select(MiniK_Total, DSM5_Total),
+  .id = "Study"
+)
+
+focal_correlations <- focal_scores %>%
+  group_by(Study) %>%
+  summarise(
+    n = sum(complete.cases(MiniK_Total, DSM5_Total)),
+    r = cor(MiniK_Total, DSM5_Total, use = "complete.obs")
+  )
+
+focal_correlations
+
+focal_plot <- ggscatterhist(
+  focal_scores,
+  x = "MiniK_Total", y = "DSM5_Total",
+  color = "Study", size = 1.1, alpha = 0.55,
+  palette = unname(study_palette),
+  margin.plot = "density",
+  margin.params = list(fill = "Study", color = "black", size = 0.2),
+  add = "reg.line", add.params = list(linewidth = 0.45),
+  conf.int = TRUE, cor.coef = FALSE,
+  title = "Mini-K and DSM-5",
+  xlab = "Mini-K total score\n ", ylab = "DSM-5 total (0-92)",
+  ggtheme = publication_theme, font.family = plot_font,
+  print = FALSE
+)
+study_legend <- get_legend(focal_plot$sp)
+focal_plot$sp <- focal_plot$sp +
+  theme(legend.position = "none", plot.margin = margin(8, 2, 2, 2))
+focal_figure <- print(focal_plot)
+
+```
+
+
+# Data quality checks
+
+## Reverse-coded attachment (AAQ) items
+
+```{r}
+aaq_item_means <- bind_rows(
+  Original = original_data %>%
+    transmute(
+      reverse_keyed_mean = 6 - rowMeans(pick(all_of(sprintf("AAQ_%02d", 4:9)))),
+      remaining_mean = rowMeans(pick(all_of(sprintf("AAQ_%02d", 1:3))))
+    ),
+  Replication = replication_included %>%
+    transmute(
+      reverse_keyed_mean = rowMeans(pick(all_of(paste0("Q15_", 4:9)))),
+      remaining_mean = rowMeans(pick(all_of(paste0("Q15_", 1:3))))
+    ),
+  .id = "Study"
+)
+
+aaq_correlations <- aaq_item_means %>%
+  group_by(Study) %>%
+  summarise(
+    n = sum(complete.cases(reverse_keyed_mean, remaining_mean)),
+    r = cor(reverse_keyed_mean, remaining_mean, use = "complete.obs"),
+    p = cor.test(reverse_keyed_mean, remaining_mean, method = "pearson")$p.value
+  )
+
+aaq_correlations
+
+aaq_plot <- ggscatterhist(
+  aaq_item_means,
+  x = "reverse_keyed_mean", y = "remaining_mean",
+  color = "Study", size = 1.1, alpha = 0.55,
+  palette = unname(study_palette),
+  margin.plot = "density",
+  margin.params = list(fill = "Study", color = "black", size = 0.2),
+  add = "reg.line", add.params = list(linewidth = 0.45),
+  conf.int = TRUE, cor.coef = FALSE,
+  title = "AAQ",
+  xlab = "Reverse-keyed mean\n(unreversed)",
+  ylab = "Remaining-item mean",
+  ggtheme = publication_theme, font.family = plot_font,
+  print = FALSE
+)
+aaq_plot$sp <- aaq_plot$sp +
+  theme(legend.position = "none", plot.margin = margin(8, 2, 2, 2))
+aaq_figure <- print(aaq_plot)
+
+
+```
+
+## Reverse coded BPA items
+
+```{r}
+bpa_item_means <- bind_rows(
+  Original = original_data %>%
+    transmute(
+      reverse_keyed_mean = 6 - rowMeans(pick(all_of(sprintf("BPAS_%02d", c(7, 18))))),
+      remaining_mean = rowMeans(pick(all_of(sprintf("BPAS_%02d", setdiff(1:29, c(7, 18))))))
+    ),
+  Replication = replication_included %>%
+    transmute(
+      reverse_keyed_mean = rowMeans(pick(all_of(paste0("Q17_", c(7, 18))))),
+      remaining_mean = rowMeans(pick(all_of(paste0("Q17_", setdiff(1:29, c(7, 18))))))
+    ),
+  .id = "Study"
+)
+
+bpa_correlations <- bpa_item_means %>%
+  group_by(Study) %>%
+  summarise(
+    n = sum(complete.cases(reverse_keyed_mean, remaining_mean)),
+    r = cor(reverse_keyed_mean, remaining_mean, use = "complete.obs"),
+    p = cor.test(reverse_keyed_mean, remaining_mean, method = "pearson")$p.value
+  )
+
+bpa_correlations
+
+bpa_plot <- ggscatterhist(
+  bpa_item_means,
+  x = "reverse_keyed_mean", y = "remaining_mean",
+  color = "Study", size = 1.1, alpha = 0.55,
+  palette = unname(study_palette),
+  margin.plot = "density",
+  margin.params = list(fill = "Study", color = "black", size = 0.2),
+  add = "reg.line", add.params = list(linewidth = 0.45),
+  conf.int = TRUE, cor.coef = FALSE,
+  title = "BPAS",
+  xlab = "Reverse-keyed mean\n(unreversed)",
+  ylab = "Remaining-item mean",
+  ggtheme = publication_theme, font.family = plot_font,
+  print = FALSE
+)
+bpa_plot$sp <- bpa_plot$sp +
+  theme(legend.position = "none", plot.margin = margin(8, 2, 2, 2))
+bpa_figure <- print(bpa_plot)
+
+
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3.1
+#| fig-cap: "Panel A shows unadjusted Mini-K and DSM-5 total scores and linear fits; the focal test reported above is a partial correlation controlling for age. All panels use the same replication sample (n = 68)."
+publication_figure <- ggarrange(
+  focal_figure, aaq_figure, bpa_figure,
+  ncol = 3, nrow = 1,
+  common.legend = TRUE, legend = "top", legend.grob = study_legend,
+  labels = c("A", "B", "C"),
+  font.label = list(size = 15, face = "plain", family = plot_font),
+  label.x = 0.01, label.y = 0.99, hjust = 0, vjust = 1
+)
+publication_figure
+
+ggsave("figures/hurst_three_panel.svg", publication_figure,
+       device = svglite::svglite, width = 7, height = 3.1, bg = "white")
+```
