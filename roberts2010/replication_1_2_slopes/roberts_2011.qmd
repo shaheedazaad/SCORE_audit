@@ -1,0 +1,80 @@
+---
+title: "Roberts et al. (2010): reproducer's analysis, ECLS-K:2011"
+format:
+  html:
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+library(haven)
+library(lavaan)
+
+d <- read_sav("ECLSK2011_K5PUF.sav",
+              col_select = c(S2_ID, W1C0, X2PLTOT, X12LANGST, P1PRMLNG, P2PRIMLN, X_RACETH_R,
+                             X2PUBPRI, X4PUBPRI, X7PUBPRI, X9PUBPRI,
+                             X2RSCALK5, X4RSCALK5, X7RSCALK5, X9RSCALK5))
+d <- as.data.frame(zap_labels(d))
+
+recode <- c("X2PLTOT", "X2RSCALK5", "X4RSCALK5", "X7RSCALK5", "X9RSCALK5")
+d[recode] <- lapply(d[recode], function(x) ifelse(x %in% c(-9, -8, -7, -1), NA, x))
+
+d <- d[rowSums(!is.na(d[c("X2RSCALK5", "X4RSCALK5", "X7RSCALK5", "X9RSCALK5")])) > 0, ]
+d <- d[!(d$X2PLTOT %in% 0:15), ]
+d <- d[!(d$X2PUBPRI %in% 2 | d$X4PUBPRI %in% 2 | d$X7PUBPRI %in% 2 | d$X9PUBPRI %in% 2), ]
+
+d$group <- ifelse(d$X12LANGST == 2, 1,
+             ifelse(d$P1PRMLNG == 2 | d$P2PRIMLN == 2, 2,
+               ifelse(d$X12LANGST != 2 & d$X_RACETH_R == 5, 3, 0)))
+d <- d[d$group %in% 1:3, ]
+d$group <- factor(d$group, 1:3, c("English", "Spanish", "Asian"))
+table(d$group)
+
+d <- d[d$W1C0 > 0, ]
+nrow(d)
+```
+
+```{r}
+model <- "
+i =~ 1*X2RSCALK5 + 1*X4RSCALK5 + 1*X7RSCALK5 + 1*X9RSCALK5
+s =~ 0*X2RSCALK5 + 1*X4RSCALK5 + 3*X7RSCALK5 + 5*X9RSCALK5
+q =~ 0*X2RSCALK5 + 1*X4RSCALK5 + 9*X7RSCALK5 + 25*X9RSCALK5
+X2RSCALK5 ~~ 0*X2RSCALK5
+X9RSCALK5 ~~ 0*X9RSCALK5
+"
+
+fit <- function(extra = "") {
+  growth(paste(model, extra), data = d, group = "group", group.label = levels(d$group),
+         estimator = "MLR", missing = "ml", sampling.weights = "W1C0", cluster = "S2_ID")
+}
+
+base <- fit()
+eng_asi_i <- fit("i ~ c(a, b, a)*1")
+spa_asi_i <- fit("i ~ c(b, a, a)*1")
+eng_spa_i <- fit("i ~ c(a, a, b)*1")
+spa_asi_s <- fit("s ~ c(b, a, a)*1")
+```
+
+```{r}
+est <- parameterEstimates(base)
+est <- est[est$op == "~1" & est$lhs %in% c("i", "s", "q"), c("group", "lhs", "est", "se")]
+
+data.frame(
+  group = c("English", "Spanish", "Asian"),
+  i = est$est[est$lhs == "i"],
+  s = est$est[est$lhs == "s"],
+  q = est$est[est$lhs == "q"]
+)
+```
+
+```{r}
+test <- function(m) lavTestLRT(base, m, method = "satorra.bentler.2001")[2, "Pr(>Chisq)"]
+
+data.frame(
+  comparison = c("intercept English = Asian", "intercept Spanish = Asian",
+                 "intercept English = Spanish", "slope Spanish = Asian"),
+  p = c(test(eng_asi_i), test(spa_asi_i), test(eng_spa_i), test(spa_asi_s))
+)
+```

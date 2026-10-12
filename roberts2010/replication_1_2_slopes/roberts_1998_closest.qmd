@@ -1,0 +1,143 @@
+---
+title: "Roberts et al. (2010): reproducer's analysis adjusted towards Roberts' decisions, 1998 ECLS-K"
+format:
+  html:
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Changes to the reproducer's code
+
+| # | Decision | Reproducer | This version | Basis in Roberts et al. (2010) |
+|---|---|---|---|---|
+| 1 | English proficiency by end of kindergarten | Spring-K OLDS score `C2SCTOT` ≥ 37 | ECLS-K composite `CPSOLDS` = 1 or 2 (passed English OLDS in fall or spring K) | "proficient in oral English by the end of kindergarten, including students who became proficient during the course of their kindergarten year" (p. 671) |
+| 2 | Native English speakers | `WKLANGST` = English | `CPSOLDS` = 0 (not identified as needing the OLDS) | "Children in households speaking languages other than English were first given the English-language OLDS" (p. 672) |
+| 3 | Spanish ELLs | Parent primary language Spanish (`P1PRMLNG`/`P2PRMLNG`) | ELL (change 1) and Spanish spoken at home by parent report or child item (`C1SPHOME`/`C2SPHOME`) | "Primary language was identified as the language spoken at home during the student's kindergarten year" (p. 671) |
+| 4 | Asian ELLs | `WKLANGST` not English and `RACE` = Asian | ELL (change 1) and `RACE` = Asian, not Spanish | "Asian-language status was assumed for students identified as ELLs and coded as Asian in the race/ethnicity fields" (p. 671) |
+| 5 | Time scores (3rd, 5th grade) | 2.62, 3.36 | 3, 5 (grade years) | 3rd and 5th grade described as the "actual times" of the third and fourth measures (p. 673) |
+
+The weight filter also drops children with a missing weight, which the new sample contains (Mplus drops these cases automatically).
+
+Unchanged because Roberts et al. do not specify an alternative: minimum data rule, private-school rule, weight (`C2CW0`), clustering (`S2_ID`), fixed residual variances.
+
+Not possible to change: the reading scores in the K–8 file are the later K–8 rescaling (`C*R4RSCL`); Roberts et al. used the earlier K–5 scale, available only in the 2006 CD-ROM release (NCES 2006-035).
+
+## Code differences
+
+```diff
+- d <- d[!(d$C2SCTOT %in% 0:36), ]
++ d <- d[d$CPSOLDS %in% c(0, 1, 2), ]
+```
+
+```diff
+- d$group <- ifelse(d$WKLANGST == 2, 1,
+-              ifelse(d$P1PRMLNG == 2 | d$P2PRMLNG == 2, 2,
+-                ifelse(d$WKLANGST != 2 & d$RACE == 5, 3, 0)))
++ spanish <- d$P1PRMLNG %in% 2 | d$P2PRMLNG %in% 2 | d$C1SPHOME %in% 1 | d$C2SPHOME %in% 1
++ d$group <- ifelse(d$CPSOLDS == 0, 1,
++              ifelse(spanish, 2,
++                ifelse(d$RACE == 5, 3, 0)))
+```
+
+```diff
+- d <- d[d$C2CW0 > 0, ]
++ d <- d[!is.na(d$C2CW0) & d$C2CW0 > 0, ]
+```
+
+```diff
+- s =~ 0*C2R4RSCL + 1*C4R4RSCL + 2.62*C5R4RSCL + 3.36*C6R4RSCL
+- q =~ 0*C2R4RSCL + 1*C4R4RSCL + 6.8644*C5R4RSCL + 11.2896*C6R4RSCL
++ s =~ 0*C2R4RSCL + 1*C4R4RSCL + 3*C5R4RSCL + 5*C6R4RSCL
++ q =~ 0*C2R4RSCL + 1*C4R4RSCL + 9*C5R4RSCL + 25*C6R4RSCL
+```
+
+## Analysis
+
+```{r}
+library(haven)
+library(lavaan)
+
+d <- read_sav("ECLSK_98_99_K8_CHILD_v1_0.sav",
+              col_select = c(S2_ID, C2CW0, CPSOLDS, P1PRMLNG, P2PRMLNG, C1SPHOME, C2SPHOME, RACE,
+                             S2KPUPRI, S4PUPRI, S5PUPRI, S6PUPRI,
+                             C2R4RSCL, C4R4RSCL, C5R4RSCL, C6R4RSCL,
+                             C2R4RPB7, C4R4RPB7, C5R4RPB7, C6R4RPB7,
+                             C2R4RPB8, C4R4RPB8, C5R4RPB8, C6R4RPB8))
+d <- as.data.frame(zap_labels(d))
+
+recode <- grep("^C[2456]R4", names(d), value = TRUE)
+d[recode] <- lapply(d[recode], function(x) ifelse(x %in% c(-9, -8, -7, -1), NA, x))
+
+d <- d[rowSums(!is.na(d[grep("^C[2456]R4", names(d))])) > 0, ]
+d <- d[d$CPSOLDS %in% c(0, 1, 2), ]
+d <- d[!(d$S2KPUPRI %in% 2 | d$S4PUPRI %in% 2 | d$S5PUPRI %in% 2 | d$S6PUPRI %in% 2), ]
+
+spanish <- d$P1PRMLNG %in% 2 | d$P2PRMLNG %in% 2 | d$C1SPHOME %in% 1 | d$C2SPHOME %in% 1
+d$group <- ifelse(d$CPSOLDS == 0, 1,
+             ifelse(spanish, 2,
+               ifelse(d$RACE == 5, 3, 0)))
+d <- d[d$group %in% 1:3, ]
+d$group <- factor(d$group, 1:3, c("English", "Spanish", "Asian"))
+
+data.frame(
+  group = c("English", "Spanish", "Asian", "Total"),
+  n_mine = c(as.vector(table(d$group)), nrow(d)),
+  n_reproducer = c(12298, 634, 342, 13274),
+  n_roberts = c(10812, 736, 464, 12012)
+)
+
+d <- d[!is.na(d$C2CW0) & d$C2CW0 > 0, ]
+nrow(d)
+```
+
+```{r}
+model <- "
+i =~ 1*C2R4RSCL + 1*C4R4RSCL + 1*C5R4RSCL + 1*C6R4RSCL
+s =~ 0*C2R4RSCL + 1*C4R4RSCL + 3*C5R4RSCL + 5*C6R4RSCL
+q =~ 0*C2R4RSCL + 1*C4R4RSCL + 9*C5R4RSCL + 25*C6R4RSCL
+C2R4RSCL ~~ 0*C2R4RSCL
+C6R4RSCL ~~ 0*C6R4RSCL
+"
+
+fit <- function(extra = "") {
+  growth(paste(model, extra), data = d, group = "group", group.label = levels(d$group),
+         estimator = "MLR", missing = "ml", sampling.weights = "C2CW0", cluster = "S2_ID")
+}
+
+base <- fit()
+eng_asi_i <- fit("i ~ c(a, b, a)*1")
+spa_asi_i <- fit("i ~ c(b, a, a)*1")
+eng_spa_i <- fit("i ~ c(a, a, b)*1")
+spa_asi_s <- fit("s ~ c(b, a, a)*1")
+```
+
+```{r}
+est <- parameterEstimates(base)
+est <- est[est$op == "~1" & est$lhs %in% c("i", "s", "q"), c("group", "lhs", "est", "se")]
+
+data.frame(
+  group = c("English", "Spanish", "Asian"),
+  i_mine = est$est[est$lhs == "i"],
+  i_reproducer = c(44.95, 39.27, 51.06),
+  i_roberts = c(40.12, 34.13, 42.58),
+  s_mine = est$est[est$lhs == "s"],
+  s_reproducer = c(NA, 24.59, 34.59),
+  s_roberts = c(34.37, 30.18, 35.18),
+  q_mine = est$est[est$lhs == "q"],
+  q_roberts = c(-2.99, -2.33, -3.13)
+)
+```
+
+```{r}
+test <- function(m) lavTestLRT(base, m, method = "satorra.bentler.2001")[2, "Pr(>Chisq)"]
+
+data.frame(
+  comparison = c("intercept English = Asian", "intercept Spanish = Asian",
+                 "intercept English = Spanish", "slope Spanish = Asian"),
+  p_mine = c(test(eng_asi_i), test(spa_asi_i), test(eng_spa_i), test(spa_asi_s)),
+  p_reproducer = c(7.4e-16, 1.5e-30, 3e-11, 1.2e-9),
+  p_roberts = c("< .05", "< .001", "< .05", "< .01")
+)
+```

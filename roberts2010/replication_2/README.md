@@ -1,1 +1,0 @@
-There is no re-analysis to run here, download `Roberts_output.txt` from the replication repo https://osf.io/yv2am/overview which contains the correct pairwise comparisons.

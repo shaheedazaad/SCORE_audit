@@ -1,0 +1,113 @@
+---
+title: "Roberts et al. (2010): reproducer's analysis, 1998 ECLS-K"
+format:
+  html:
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+library(haven)
+library(lavaan)
+
+d <- read_sav("ECLSK_98_99_K8_CHILD_v1_0.sav",
+              col_select = c(S2_ID, C2CW0, C2SCTOT, WKLANGST, P1PRMLNG, P2PRMLNG, RACE,
+                             S2KPUPRI, S4PUPRI, S5PUPRI, S6PUPRI,
+                             C2R4RSCL, C4R4RSCL, C5R4RSCL, C6R4RSCL,
+                             C2R4RPB7, C4R4RPB7, C5R4RPB7, C6R4RPB7,
+                             C2R4RPB8, C4R4RPB8, C5R4RPB8, C6R4RPB8))
+d <- as.data.frame(zap_labels(d))
+
+recode <- c("C2SCTOT", grep("^C[2456]R4", names(d), value = TRUE))
+d[recode] <- lapply(d[recode], function(x) ifelse(x %in% c(-9, -8, -7, -1), NA, x))
+
+d <- d[rowSums(!is.na(d[grep("^C[2456]R4", names(d))])) > 0, ]
+d <- d[!(d$C2SCTOT %in% 0:36), ]
+d <- d[!(d$S2KPUPRI %in% 2 | d$S4PUPRI %in% 2 | d$S5PUPRI %in% 2 | d$S6PUPRI %in% 2), ]
+
+d$group <- ifelse(d$WKLANGST == 2, 1,
+             ifelse(d$P1PRMLNG == 2 | d$P2PRMLNG == 2, 2,
+               ifelse(d$WKLANGST != 2 & d$RACE == 5, 3, 0)))
+d <- d[d$group %in% 1:3, ]
+d$group <- factor(d$group, 1:3, c("English", "Spanish", "Asian"))
+table(d$group)
+
+d <- d[d$C2CW0 > 0, ]
+nrow(d)
+```
+
+## Reproducer's time coding (0, 1, 2.62, 3.36)
+
+```{r}
+model <- function(t3, t5) paste0("
+i =~ 1*C2R4RSCL + 1*C4R4RSCL + 1*C5R4RSCL + 1*C6R4RSCL
+s =~ 0*C2R4RSCL + 1*C4R4RSCL + ", t3, "*C5R4RSCL + ", t5, "*C6R4RSCL
+q =~ 0*C2R4RSCL + 1*C4R4RSCL + ", t3^2, "*C5R4RSCL + ", t5^2, "*C6R4RSCL
+C2R4RSCL ~~ 0*C2R4RSCL
+C6R4RSCL ~~ 0*C6R4RSCL
+")
+
+fit <- function(t3, t5, extra = "") {
+  growth(paste(model(t3, t5), extra), data = d, group = "group", group.label = levels(d$group),
+         estimator = "MLR", missing = "ml", sampling.weights = "C2CW0", cluster = "S2_ID")
+}
+
+base <- fit(2.62, 3.36)
+eng_asi_i <- fit(2.62, 3.36, "i ~ c(a, b, a)*1")
+spa_asi_i <- fit(2.62, 3.36, "i ~ c(b, a, a)*1")
+eng_spa_i <- fit(2.62, 3.36, "i ~ c(a, a, b)*1")
+spa_asi_s <- fit(2.62, 3.36, "s ~ c(b, a, a)*1")
+```
+
+```{r}
+est <- parameterEstimates(base)
+est <- est[est$op == "~1" & est$lhs %in% c("i", "s", "q"), c("group", "lhs", "est", "se")]
+
+data.frame(
+  group = c("English", "Spanish", "Asian"),
+  i_mine = est$est[est$lhs == "i"],
+  i_reproducer = c(44.95, 39.27, 51.06),
+  i_roberts = c(40.12, 34.13, 42.58),
+  s_mine = est$est[est$lhs == "s"],
+  s_reproducer = c(NA, 24.59, 34.59),
+  s_roberts = c(34.37, 30.18, 35.18),
+  q_mine = est$est[est$lhs == "q"],
+  q_roberts = c(-2.99, -2.33, -3.13)
+)
+```
+
+```{r}
+test <- function(m) lavTestLRT(base, m, method = "satorra.bentler.2001")[2, "Pr(>Chisq)"]
+
+data.frame(
+  comparison = c("intercept English = Asian", "intercept Spanish = Asian",
+                 "intercept English = Spanish", "slope Spanish = Asian"),
+  p_mine = c(test(eng_asi_i), test(spa_asi_i), test(eng_spa_i), test(spa_asi_s)),
+  p_reproducer = c(7.4e-16, 1.5e-30, 3e-11, 1.2e-9),
+  p_roberts = c("< .05", "< .001", "< .05", "< .01")
+)
+```
+
+## Roberts et al.'s time coding (0, 1, 3, 5)
+
+```{r}
+base_r <- fit(3, 5)
+spa_asi_s_r <- fit(3, 5, "s ~ c(b, a, a)*1")
+
+est_r <- parameterEstimates(base_r)
+est_r <- est_r[est_r$op == "~1" & est_r$lhs %in% c("i", "s", "q"), c("group", "lhs", "est", "se")]
+
+data.frame(
+  group = c("English", "Spanish", "Asian"),
+  i_mine = est_r$est[est_r$lhs == "i"],
+  i_roberts = c(40.12, 34.13, 42.58),
+  s_mine = est_r$est[est_r$lhs == "s"],
+  s_roberts = c(34.37, 30.18, 35.18),
+  q_mine = est_r$est[est_r$lhs == "q"],
+  q_roberts = c(-2.99, -2.33, -3.13)
+)
+
+lavTestLRT(base_r, spa_asi_s_r, method = "satorra.bentler.2001")[2, "Pr(>Chisq)"]
+```
