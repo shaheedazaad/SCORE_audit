@@ -1,0 +1,2 @@
+Download the study's materials from and place everything in `data`: https://osf.io/q7hpx/
+Check their Gorilla materials for the incorrect condition assignment: https://app.gorilla.sc/openmaterials/395187

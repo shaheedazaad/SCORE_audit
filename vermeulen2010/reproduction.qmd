@@ -1,0 +1,505 @@
+---
+title: "Vermeulen (2010): replication data reconstruction"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+execute:
+  warning: false
+  message: false
+---
+
+This report reconstructs SCORE's replication of Vermeulen et al. (2010) from
+raw Gorilla exports and examines questionnaire responses and recognition performance.
+
+## Reproduce this report
+
+Run `quarto render reproduction.qmd` from this folder. Required R packages:
+tidyverse (dplyr ≥ 1.1.1, tidyr ≥ 1.3.0), car, knitr, ggpubr, sysfonts,
+showtext, and svglite. Inputs:
+
+- `data/data_exp_64376-v7.zip` through `data/data_exp_64376-v10.zip`: raw exports.
+- `data/Vermeulen Data Submission.csv`: comparison scores.
+- `fonts/Helvetica Neue LT Std 57 Condensed.otf`: optional font; otherwise sans-serif.
+
+Outputs are saved to `processed/`, `figures/combined_diagnostics.svg`, and a
+self-contained HTML report. Processing follows `data/Data Processing Pipeline.docx`;
+reference statistics come from `Full Output.pdf` (pp. 2–8, 28–34).
+
+```{r}
+#| label: setup
+library(tidyverse)
+knitr::opts_chunk$set(dev = "svglite")
+stopifnot(packageVersion("dplyr") >= "1.1.1", packageVersion("tidyr") >= "1.3.0")
+font_file <- file.path("fonts", "Helvetica Neue LT Std 57 Condensed.otf")
+plot_font <- "sans"
+if (file.exists(font_file)) {
+  plot_font <- "Helvetica Neue LT Std 57 Condensed"
+  sysfonts::font_add(family = plot_font, regular = font_file)
+  showtext::showtext_auto()
+}
+dir.create("processed", showWarnings = FALSE)
+```
+
+## Import responses
+
+ZIPs are extracted to temporary folders. Records retain source filenames and row
+numbers; only the `END OF FILE` trailer is removed. Participant private IDs link
+records, and completion codes link to the submitted scores.
+
+```{r}
+#| label: import-responses
+zips <- file.path("data", paste0("data_exp_64376-v", 7:10, ".zip"))
+stopifnot(all(file.exists(zips)))
+raw <- map_dfr(zips, function(z) {
+  folder <- tempfile()
+  dir.create(folder)
+  on.exit(unlink(folder, recursive = TRUE))
+  files <- unzip(z, exdir = folder)
+  map_dfr(files, function(f) {
+    lines <- readLines(f, warn = FALSE)
+    lines <- lines[!grepl('^"?END OF FILE"?,*$', lines)]
+    x <- read_csv(I(paste(lines, collapse = "\n")),
+                  col_types = cols(.default = col_character()))
+    stopifnot(nrow(problems(x)) == 0)
+    mutate(x, source_archive = basename(z), source_file = basename(f),
+           source_row = row_number() + 1L)
+  })
+}) %>% mutate(id = `Participant Private ID`, code = `Participant Completion Code`,
+              node = `Tree Node Key`)
+stopifnot(!anyNA(raw$id))
+saveRDS(raw, "processed/raw_events.rds")
+
+# Preserve individual questionnaire answers, numeric values, and timing metadata.
+questionnaire_items <- raw %>%
+  filter(str_starts(node, "questionnaire-")) %>%
+  select(id, code, node, source_archive, source_file, source_row,
+         `UTC Timestamp`, `END QUESTIONNAIRE`, matches("^response-")) %>%
+  pivot_longer(matches("^response-"), names_to = "field", values_to = "value",
+               values_drop_na = TRUE)
+saveRDS(questionnaire_items, "processed/questionnaire_items.rds")
+
+# Emotion labels are present in the shallow learning tasks, but blank in deep tasks.
+learning_nodes <- c("task-a6sx", "task-1byy", "task-9zyh", "task-kwjc")
+old_key <- raw %>%
+  filter(node %in% c("task-9zyh", "task-kwjc"), !is.na(WORD), !is.na(Emotion)) %>%
+  transmute(word = word(WORD),
+            emotion = recode(Emotion, HAPPY = "JOY", ANGRY = "ANG",
+                             DISGUST = "DIS", CONTROL = "CON"), old = TRUE) %>%
+  distinct()
+stopifnot(!anyDuplicated(old_key$word), nrow(old_key) == 48)
+
+# Lure allocation reconstructed from the submitted false-alarm totals (see below).
+lure_key <- tribble(
+  ~emotion, ~words,
+  "JOY", "AMUSEMENT CHARM COMFORT EXULTATION FROLIC GAIETY GLEE MIRTH",
+  "ANG", "ABHORRENCE CHOLERIC CROSS HOSTILE INDIGNANT IRASCIBLE PROVOKED RILED",
+  "DIS", "BITTER COMPOST DISGUST DISTASTE EXPRESS REPUGNANCE REVOLT REVULSION"
+) %>% separate_longer_delim(words, delim = " ") %>%
+  rename(word = words) %>% mutate(old = FALSE)
+
+trials <- raw %>%
+  filter((node %in% learning_nodes & !is.na(WORD)) |
+           (node == "task-cdq7" & !is.na(WORDS))) %>%
+  mutate(phase = if_else(node == "task-cdq7", "recognition", "learning"),
+         word = word(coalesce(WORDS, WORD))) %>%
+  left_join(bind_rows(old_key, lure_key), by = "word", relationship = "many-to-one") %>%
+  mutate(emotion = coalesce(emotion, "CON"), old = coalesce(old, FALSE),
+         rt_ms = as.numeric(`Reaction Time`),
+         response = Response,
+         accuracy = if_else(phase == "recognition",
+                            as.numeric((response == "OLD") == old),
+                            as.numeric(Correct)))
+stopifnot(all(trials$response[trials$phase == "recognition"] %in% c("OLD", "NEW")))
+saveRDS(trials, "processed/trials.rds")
+```
+
+`trials.rds` retains all recorded word events and metadata, without RT trimming
+or deduplication. Recognition accuracy is recomputed because Gorilla's answer key is empty.
+
+## Reconstruct participant scores
+
+TAS-20 uses the diary's reverse items and subscales, with high alexithymia defined
+as TAS-20 > 64. PANAS scoring follows **export order** (1, 3, 2, 4, …, 20) to
+match the submission. Missing items produce missing totals.
+
+Old-word emotion labels come from learning trials. Lure categories were inferred
+from submitted false-alarm totals: ABHORRENCE is coded as anger; BITTER and EXPRESS
+as disgust. This reproduces the submitted coding without validating the intended categories.
+
+Recognition is `max(0, (hits - false alarms) / 8)`; unfloored scores are also retained.
+Facilitation is congruent minus incongruent recognition.
+
+```{r}
+#| label: score-participants
+q <- raw %>% filter(node == "questionnaire-a81r")
+stopifnot(!anyDuplicated(q$id))
+item_matrix <- function(x, order = 1:20) {
+  as.matrix(x %>% select(all_of(paste0("response-", order, "-quantised"))) %>%
+              mutate(across(everything(), as.numeric)))
+}
+tas <- item_matrix(q)
+stopifnot(all(tas %in% 1:5 | is.na(tas)))
+tas[, c(4, 5, 10, 18, 19)] <- 6 - tas[, c(4, 5, 10, 18, 19)]
+participants <- q %>% transmute(
+  id, code, version = `Experiment Version`, status = `Participant Status`,
+  DEPTH = if_else(str_detect(`randomiser-lo1w`, "DEEP"), 1L, 2L),
+  MUSIC = if_else(str_detect(`randomiser-lo1w`, "ANGRY"), 1L, 2L),
+  TAS20 = rowSums(tas), DDF = rowSums(tas[, c(2, 4, 11, 12, 17)]),
+  DIF = rowSums(tas[, c(1, 3, 6, 7, 9, 13, 14)]),
+  EOT = rowSums(tas[, c(5, 8, 10, 15, 16, 18, 19, 20)]),
+  TASGRP = if_else(TAS20 > 64, 2L, 1L))
+for (occasion in c("PRE", "POST")) {
+  node_name <- if (occasion == "PRE") "questionnaire-hvno" else "questionnaire-cz1o"
+  q <- filter(raw, node == node_name)
+  stopifnot(!anyDuplicated(q$id))
+  a <- item_matrix(q, c(1, 3, 2, 4:20))
+  affect <- tibble(id = q$id,
+    PA = rowSums(a[, c(1, 3, 5, 9, 10, 12, 14, 16, 17, 19)]),
+    NAffect = rowSums(a[, c(2, 4, 6, 7, 8, 11, 13, 15, 18, 20)]))
+  names(affect)[2:3] <- paste0(c("PAS", "NAS"), occasion)
+  participants <- left_join(participants, affect, by = "id", relationship = "one-to-one")
+}
+recognition <- trials %>% filter(phase == "recognition")
+stopifnot(all(count(recognition, id)$n == 72),
+          !anyDuplicated(recognition[c("id", "word")]))
+memory <- recognition %>% filter(emotion != "CON") %>%
+  group_by(id, emotion) %>%
+  summarise(n_old = sum(old), n_new = sum(!old),
+            HIT = sum(response == "OLD" & old),
+            FA = sum(response == "OLD" & !old), .groups = "drop")
+stopifnot(all(memory$n_old == 8), all(memory$n_new == 8))
+memory <- memory %>% mutate(UNFLOORED = (HIT - FA) / 8,
+                            IND = pmax(0, UNFLOORED)) %>%
+  select(-n_old, -n_new) %>%
+  pivot_wider(names_from = emotion, values_from = c(HIT, FA, IND, UNFLOORED),
+              names_glue = "{emotion}{.value}")
+participants <- left_join(participants, memory, by = "id", relationship = "one-to-one") %>%
+  mutate(FACIND = if_else(MUSIC == 1, ANGIND - JOYIND, JOYIND - ANGIND),
+         included = status == "complete" & !is.na(code) & code != "dsvzdk")
+knitr::kable(count(participants, version, included), caption = "Sample reconstruction")
+```
+
+Of 1,098 participants, 1,096 appear in the submission. One has status `live` and
+no completion code; completed participant `dsvzdk` was excluded for an undocumented
+reason. Both remain in the exports, flagged as excluded in `participants.csv`.
+
+## Check against the submitted data
+
+Compare all 21 reconstructed variables with the submission for every included participant.
+
+```{r}
+#| label: validate-scores
+submitted <- read.csv("data/Vermeulen Data Submission.csv", check.names = FALSE)
+names(submitted) <- make.unique(names(submitted))
+names(submitted)[c(1, 6, 7, 34:39)] <-
+  c("code", "DEPTH", "MUSIC", "JOYIND", "ANGIND", "DISIND", "Cong", "Incong", "FACIND")
+analysis_data <- filter(participants, included)
+stopifnot(nrow(analysis_data) == 1096, !anyDuplicated(submitted$code),
+          setequal(analysis_data$code, submitted$code))
+matched <- inner_join(analysis_data, submitted, by = "code", suffix = c("", "_ref"),
+                      relationship = "one-to-one")
+variables <- c("DEPTH", "MUSIC", "PASPRE", "NASPRE", "PASPOST", "NASPOST",
+               "TAS20", "TASGRP", "DDF", "DIF", "EOT", "JOYHIT", "JOYFA",
+               "ANGHIT", "ANGFA", "DISHIT", "DISFA", "JOYIND", "ANGIND", "DISIND", "FACIND")
+comparison <- map_dfr(variables, function(v) {
+  a <- matched[[v]]; b <- matched[[paste0(v, "_ref")]]
+  tibble(variable = v, n = length(a),
+         mismatches = sum(is.na(a) != is.na(b) |
+                           (!is.na(a) & !is.na(b) & abs(a - b) > 1e-8)))
+})
+knitr::kable(comparison)
+stopifnot(all(comparison$mismatches == 0))
+write_csv(participants, "processed/participants.csv")
+write_csv(comparison, "processed/score_checks.csv")
+```
+
+## TAS-20 scores
+
+The [original paper](https://doi.org/10.1002/per.758) reports mean TAS-20 = 47.11
+(SE = 1.04), median = 47, and n = 107 (p. 558). Replication descriptives use
+all 1,096 included participants.
+
+```{r}
+#| label: tas20-descriptives
+tas20_comparison <- bind_rows(
+  tibble(sample = "Original (reported)", n = 107L,
+         mean = 47.11, median = 47, SE = 1.04),
+  analysis_data %>% summarise(
+    sample = "Replication (reconstructed)", n = sum(!is.na(TAS20)),
+    mean = mean(TAS20), median = median(TAS20), SE = sd(TAS20) / sqrt(n)))
+knitr::kable(tas20_comparison, digits = 2,
+             col.names = c("Sample", "n", "Mean", "Median", "SE"))
+```
+
+The replication mean is **`r sprintf("%.2f", tas20_comparison$mean[2])`**
+(`r sprintf("%.2f", tas20_comparison$mean[2] - tas20_comparison$mean[1])` points higher);
+its median is **`r tas20_comparison$median[2]`**
+(`r tas20_comparison$median[2] - tas20_comparison$median[1]` points higher).
+
+## Main results
+
+The model crosses depth, music, and alexithymia group, with word type (joy, anger)
+repeated within participants. Models of the two word types' mean and difference
+reproduce SPSS's between- and within-participant F tests using sum contrasts and
+Type III sums of squares.
+
+```{r}
+#| label: main-anova
+d <- analysis_data %>% mutate(across(c(DEPTH, MUSIC, TASGRP), factor),
+                              average = (JOYIND + ANGIND) / 2,
+                              difference = JOYIND - ANGIND)
+contrasts_list <- lapply(d[c("DEPTH", "MUSIC", "TASGRP")], function(x) contr.sum(2))
+between <- lm(average ~ DEPTH * MUSIC * TASGRP, d, contrasts = contrasts_list)
+within <- lm(difference ~ DEPTH * MUSIC * TASGRP, d, contrasts = contrasts_list)
+facilitation <- lm(FACIND ~ TASGRP, d, contrasts = contrasts_list["TASGRP"])
+extract_test <- function(model, term, label, reference) {
+  tab <- car::Anova(model, type = 3)
+  f <- tab[term, "F value"]; df1 <- tab[term, "Df"]; df2 <- df.residual(model)
+  tibble(effect = label, df1, df2, F = f, p = pf(f, df1, df2, lower.tail = FALSE),
+         partial_eta2 = f * df1 / (f * df1 + df2), SPSS_F = reference,
+         matches = abs(f - reference) < 0.0005)
+}
+main_tests <- bind_rows(
+  extract_test(between, "TASGRP", "Alexithymia", 303.154),
+  extract_test(between, "MUSIC:TASGRP", "Music × alexithymia", 1.448),
+  extract_test(within, "MUSIC:TASGRP", "Word type × music × alexithymia", 2.173),
+  extract_test(facilitation, "TASGRP", "Facilitation: alexithymia", 2.002))
+knitr::kable(mutate(main_tests, p = format.pval(p, digits = 4, eps = 0)), digits = 6)
+stopifnot(all(main_tests$matches))
+
+# Equal-weight estimated marginal means, as in the SPSS output.
+grid <- expand_grid(DEPTH = levels(d$DEPTH), MUSIC = levels(d$MUSIC),
+                    TASGRP = levels(d$TASGRP))
+grid$estimate <- predict(between, grid)
+knitr::kable(grid %>% group_by(TASGRP) %>% summarise(mean = mean(estimate)), digits = 3)
+```
+
+Partial correlations control pre-task positive and negative affect within each
+music condition (SPSS pp. 32, 34). Tests are two-sided, with `n - 4` degrees of freedom.
+
+```{r}
+#| label: partial-correlations
+references <- tribble(
+  ~MUSIC, ~scale, ~JOY, ~ANG,
+  1, "TAS20", -.266, -.279,
+  1, "DDF",   -.185, -.200,
+  1, "DIF",   -.240, -.258,
+  1, "EOT",   -.221, -.217,
+  2, "TAS20", -.218, -.292,
+  2, "DDF",   -.174, -.202,
+  2, "DIF",   -.172, -.253,
+  2, "EOT",   -.194, -.257
+) %>% pivot_longer(c(JOY, ANG), names_to = "emotion", values_to = "SPSS_r")
+correlations <- pmap_dfr(references, function(MUSIC, scale, emotion, SPSS_r) {
+  x <- analysis_data %>% filter(.data$MUSIC == .env$MUSIC) %>%
+    select(all_of(c(scale, paste0(emotion, "IND"), "PASPRE", "NASPRE"))) %>% drop_na()
+  r <- cor(resid(lm(x[[1]] ~ PASPRE + NASPRE, x)),
+           resid(lm(x[[2]] ~ PASPRE + NASPRE, x)))
+  df <- nrow(x) - 4
+  tibble(music = if_else(MUSIC == 1, "Angry", "Happy"), scale, emotion,
+         n = nrow(x), df, r, p = 2 * pt(-abs(r * sqrt(df / (1 - r^2))), df),
+         SPSS_r, matches = abs(r - SPSS_r) < 0.0005)
+})
+knitr::kable(mutate(correlations, p = format.pval(p, digits = 4, eps = 0)), digits = 6)
+stopifnot(all(correlations$matches))
+write_csv(main_tests, "processed/main_tests.csv")
+write_csv(correlations, "processed/partial_correlations.csv")
+```
+
+## TAS-20 item responses
+
+Plot each participant's mean response to the five reverse-keyed items
+(4, 5, 10, 18, 19), **before reversal**, against their mean on the 15 forward-keyed
+items (n = 1,096).
+
+```{r}
+#| label: tas-keying
+#| fig-width: 7
+#| fig-height: 6
+#| fig-cap: "TAS-20 item means in the replication sample. Reverse-keyed responses are unreversed."
+reverse_items <- c(4, 5, 10, 18, 19)
+tas_responses <- raw %>% filter(node == "questionnaire-a81r") %>%
+  semi_join(analysis_data, by = "id")
+tas_raw <- item_matrix(tas_responses)
+tas_item_means <- tibble(
+  id = tas_responses$id, code = tas_responses$code,
+  Study = "Replication",
+  reverse_keyed_mean = rowMeans(tas_raw[, reverse_items]),
+  forward_keyed_mean = rowMeans(tas_raw[, setdiff(1:20, reverse_items)]))
+tas_correlation <- with(tas_item_means,
+  cor.test(reverse_keyed_mean, forward_keyed_mean, method = "pearson"))
+tas_summary <- tibble(
+  n = sum(complete.cases(tas_item_means[c("reverse_keyed_mean", "forward_keyed_mean")])),
+  r = unname(tas_correlation$estimate),
+  CI_low = tas_correlation$conf.int[1], CI_high = tas_correlation$conf.int[2],
+  p = tas_correlation$p.value)
+knitr::kable(mutate(tas_summary, p = format.pval(p, digits = 4, eps = 0)), digits = 3)
+
+publication_theme <- theme_classic(base_size = 13, base_family = plot_font) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.line = element_line(linewidth = 0.35),
+    axis.ticks = element_line(linewidth = 0.35),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 13),
+    legend.key.height = unit(13, "pt"),
+    legend.key.width = unit(18, "pt"),
+    legend.margin = margin(0, 0, 6, 0),
+    plot.title = element_text(size = 14, face = "plain"),
+    plot.caption = element_text(size = 9, hjust = 0, margin = margin(t = 4)),
+    plot.margin = margin(8, 8, 8, 8)
+  )
+tas_plot <- ggpubr::ggscatterhist(
+  tas_item_means, x = "reverse_keyed_mean", y = "forward_keyed_mean",
+  color = "Study", palette = "#FC4E07", size = 1.1, alpha = 0.55,
+  margin.plot = "density",
+  margin.params = list(fill = "Study", color = "black", size = 0.2),
+  add = "reg.line", add.params = list(linewidth = 0.45),
+  conf.int = TRUE, cor.coef = FALSE, title = "TAS-20",
+  xlab = "Reverse-keyed mean\n(unreversed)", ylab = "Forward-keyed mean",
+  ggtheme = publication_theme, font.family = plot_font, print = FALSE)
+tas_plot$sp <- tas_plot$sp +
+  theme(legend.position = "none", plot.margin = margin(8, 2, 2, 2))
+tas_figure <- print(tas_plot)
+dir.create("figures", showWarnings = FALSE)
+write_csv(tas_item_means, "processed/tas_item_means.csv")
+write_csv(tas_summary, "processed/tas_keying_correlation.csv")
+```
+
+## Hit rates and false alarms
+
+Rates pool joy and anger words: hits / 16 studied words and false alarms / 16 new
+words, for all 1,096 participants.
+
+```{r}
+#| label: hits-false-alarms
+#| fig-width: 7
+#| fig-height: 6
+#| fig-cap: "Hit rates versus false-alarm rates, pooling joy and anger words. The diagonal marks equal hit and false-alarm rates (zero hit-minus-false-alarm accuracy)."
+memory_plot_data <- analysis_data %>% transmute(
+  id, code, Study = "Replication", TAS20,
+  hit_rate = (JOYHIT + ANGHIT) / 16,
+  false_alarm_rate = (JOYFA + ANGFA) / 16,
+  accuracy = hit_rate - false_alarm_rate)
+stopifnot(all(between(memory_plot_data$hit_rate, 0, 1)),
+          all(between(memory_plot_data$false_alarm_rate, 0, 1)))
+memory_chance_summary <- memory_plot_data %>% summarise(
+  n = n(), below_chance = sum(accuracy < 0), at_chance = sum(accuracy == 0),
+  at_or_below_chance = sum(accuracy <= 0),
+  percent_at_or_below_chance = 100 * mean(accuracy <= 0))
+write_csv(memory_chance_summary, "processed/memory_chance_summary.csv")
+
+scatter_density <- function(data, x, y, title, xlab, ylab, colour, fit = TRUE) {
+  p <- ggpubr::ggscatterhist(
+    data, x = x, y = y, color = "Study", palette = colour,
+    size = 1.1, alpha = 0.55, margin.plot = "density",
+    margin.params = list(fill = "Study", color = "black", size = 0.2),
+    add = if (fit) "reg.line" else "none", add.params = list(linewidth = 0.45),
+    conf.int = fit, cor.coef = FALSE, title = title,
+    xlab = xlab, ylab = ylab, ggtheme = publication_theme, font.family = plot_font, print = FALSE)
+  p$sp <- p$sp + theme(legend.position = "none", plot.margin = margin(8, 2, 2, 2))
+  p
+}
+plot_correlation <- function(data, x, y, label) {
+  keep <- complete.cases(data[c(x, y)])
+  test <- cor.test(data[[x]][keep], data[[y]][keep], method = "pearson")
+  tibble(comparison = label, n = sum(keep), r = unname(test$estimate),
+         CI_low = test$conf.int[1], CI_high = test$conf.int[2], p = test$p.value)
+}
+focal_plot_data <- analysis_data %>% filter(MUSIC == 2) %>%
+  transmute(id, code, Study = "Replication", DIF, PASPRE, NASPRE,
+            joy_accuracy = (JOYHIT - JOYFA) / 8)
+stopifnot(nrow(focal_plot_data) == 540)
+memory_plot_correlations <- bind_rows(
+  plot_correlation(memory_plot_data, "false_alarm_rate", "hit_rate", "Hits vs false alarms"),
+  plot_correlation(focal_plot_data, "DIF", "joy_accuracy", "DIF vs joy recognition, happy music (unadjusted)"))
+knitr::kable(mutate(memory_plot_correlations, p = format.pval(p, digits = 4, eps = 0)), digits = 3)
+hit_plot <- scatter_density(memory_plot_data, "false_alarm_rate", "hit_rate",
+                            "Recognition", "False-alarm rate\n ", "Hit rate", "#E7B800", fit = FALSE)
+proportion_labels <- function(x) {
+  labels <- sub("\\.0$", "", sprintf("%.1f", x))
+  sub("^(-?)0\\.", "\\1.", labels)
+}
+hit_plot$sp <- hit_plot$sp +
+  annotate("segment", x = 0, y = 0, xend = 1, yend = 1,
+           colour = "#E7B800", linewidth = 0.45) +
+  scale_x_continuous(breaks = c(0, 0.5, 1), labels = proportion_labels) +
+  scale_y_continuous(breaks = c(0, 0.5, 1), labels = proportion_labels) +
+  theme(axis.title.y = element_text(margin = margin(r = 0)))
+hit_figure <- print(hit_plot)
+write_csv(memory_plot_data, "processed/memory_plot_data.csv")
+write_csv(memory_plot_correlations, "processed/memory_plot_correlations.csv")
+```
+
+**`r memory_chance_summary$at_or_below_chance` of
+`r format(memory_chance_summary$n, big.mark = ",")` participants
+(`r sprintf("%.1f", memory_chance_summary$percent_at_or_below_chance)`%)**
+performed at or below chance: `r memory_chance_summary$at_chance` had equal hit
+and false-alarm rates; `r memory_chance_summary$below_chance` had more false alarms.
+Chance means 50% correct on these balanced old/new words, not an individual significance test.
+
+## DIF and joy recognition
+
+SCORE claim `7RR2_d5dy7d` (trace 18) concerns DIF and joy-word recognition in the
+happy-music condition: original partial *r* = .343 (Table 2), replication *r* = −.172.
+The plot uses unfloored recognition scores for the 540 participants. The table
+compares partial correlations using floored and unfloored scores.
+
+```{r}
+#| label: tas-accuracy
+#| fig-width: 7
+#| fig-height: 6
+#| fig-cap: "DIF versus unfloored joy-word recognition in the happy-music condition (n = 540). The plot is unadjusted; the focal test controls pre-task positive and negative affect."
+focal_partial <- correlations %>%
+  filter(music == "Happy", scale == "DIF", emotion == "JOY") %>%
+  mutate(claim = "7RR2_d5dy7d")
+stopifnot(nrow(focal_partial) == 1, focal_partial$n == 540, focal_partial$matches)
+unfloored_r <- with(focal_plot_data,
+  cor(resid(lm(DIF ~ PASPRE + NASPRE)),
+      resid(lm(joy_accuracy ~ PASPRE + NASPRE))))
+focal_partial_comparison <- bind_rows(
+  focal_partial %>% transmute(scoring = "Floored (SPSS reproduction)", n, df, r, p),
+  tibble(scoring = "Unfloored (plotted)", n = nrow(focal_plot_data), df = n - 4,
+         r = unfloored_r, p = 2 * pt(-abs(r * sqrt(df / (1 - r^2))), df)))
+knitr::kable(mutate(focal_partial_comparison,
+                    p = format.pval(p, digits = 4, eps = 0)), digits = 3)
+accuracy_plot <- scatter_density(focal_plot_data, "DIF", "joy_accuracy",
+                                 "DIF / recognition", "TAS-20 DIF\n ",
+                                 "Joy recognition", "#00AFBB")
+accuracy_plot$sp <- accuracy_plot$sp +
+  scale_y_continuous(breaks = seq(-1, 1, 0.5), labels = proportion_labels) +
+  theme(axis.title.y = element_text(margin = margin(r = -3)))
+accuracy_figure <- print(accuracy_plot)
+write_csv(focal_plot_data, "processed/focal_dif_plot_data.csv")
+write_csv(focal_partial_comparison, "processed/focal_dif_partial_correlation.csv")
+```
+
+## Combined diagnostic plots
+
+```{r}
+#| label: combined-diagnostics
+#| fig-width: 7
+#| fig-height: 3.1
+#| out-width: 100%
+#| fig-cap: "A: DIF versus unfloored joy-word recognition in the happy-music condition (n = 540; unadjusted plot). B: Hit versus false-alarm rates pooled across joy and anger words. C: Forward- versus unreversed reverse-keyed TAS-20 item means. Panels B and C use all 1,096 analysis participants. A and C show linear fits with 95% confidence bands; B shows the equality diagonal."
+combined_figure <- ggpubr::ggarrange(
+  accuracy_figure, hit_figure, tas_figure, ncol = 3, nrow = 1,
+  labels = c("A", "B", "C"),
+  font.label = list(size = 15, face = "plain", family = plot_font),
+  label.x = 0.01, label.y = 0.99, hjust = 0, vjust = 1)
+combined_figure
+ggsave("figures/combined_diagnostics.svg", combined_figure,
+       device = svglite::svglite, width = 7, height = 3.1, bg = "white")
+```
+
+
+## Software versions
+
+```{r}
+#| label: session-info
+#| echo: false
+sessionInfo()
+```
