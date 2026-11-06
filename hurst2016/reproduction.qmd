@@ -1,8 +1,15 @@
 ---
 title: "Data quality issues: SCOREs Hurst and Kavanagh (2016) replication"
-format: html
-embed-resources: true
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
 ---
+
+# Setup
+
+## Packages
 
 ```{r}
 #install.packages("ppcor")
@@ -10,6 +17,8 @@ library(ppcor)
 library(tidyverse)
 library(ggpubr)
 ```
+
+## Data and plotting theme
 
 ```{r}
 original_data <- read.csv("1-s2.0-S1090513816301118-mmc1.csv")
@@ -43,6 +52,8 @@ dir.create("figures", showWarnings = FALSE)
 
 # Replication scale scoring
 
+## Scoring key
+
 | Raw items | Scale | Scoring and direction |
 |---|---|---|
 | Q15_1–Q15_9 | Adolescent Attachment Questionnaire (AAQ) | Reverse 4–9 with `6 - x`; sum. Higher = poorer attachment (9–45). |
@@ -52,6 +63,7 @@ dir.create("figures", showWarnings = FALSE)
 | Q19_1–Q19_22 | High-K Strategy Scale (HKSS) | Sum without reversing. Higher = higher-K/slower strategy (22–110). |
 | Seventeen self-harm behaviours and their frequency follow-ups | Deliberate Self-Harm Inventory (DSHI) | Sum valid reported occurrence counts; see the missing-data rules below. |
 
+## Scale scores
 
 ```{r}
 replication_included <- replication_data %>%
@@ -183,7 +195,9 @@ self_harm_issues
 
 # Reproductions
 
-Original paper:
+## Focal partial correlation (controlling for age)
+
+### Original
 
 ```{r}
 original_data %>%
@@ -191,7 +205,7 @@ original_data %>%
     pcor(., method = "pearson")
 ```
 
-Replication:
+### Replication
 
 ```{r}
 replication_scored %>%
@@ -199,6 +213,7 @@ replication_scored %>%
   pcor(., method = "pearson")
 ```
 
+## Mini-K and DSM-5 scatterplot
 
 ```{r}
 focal_scores <- bind_rows(
@@ -291,7 +306,7 @@ aaq_figure <- print(aaq_plot)
 
 ```
 
-## Reverse coded BPA items
+## Reverse-coded aggression (BPAS) items
 
 ```{r}
 bpa_item_means <- bind_rows(
@@ -340,11 +355,139 @@ bpa_figure <- print(bpa_plot)
 
 ```
 
+## Psychotic symptoms (DSM-5 items 12–13)
+
+DSM-5 Level 1 item 12 asks about "hearing things other people couldn't hear, such as voices even when no one was around"; item 13 about "feeling that someone could hear your thoughts, or that you could hear what another person was thinking". Both refer to the past two weeks. Both datasets store the items as 1–5 (1 = None, 2 = Slight / rare, 3 = Mild / several days, 4 = Moderate / more than half the days, 5 = Severe / nearly every day), so raw values are compared directly. "Either" is the higher of the two items.
+
+### Response distributions
+
+```{r}
+psychosis_items <- bind_rows(
+  Original = original_data %>%
+    transmute(Voices = DSM5_12, Thoughts = DSM5_13),
+  Replication = replication_included %>%
+    transmute(Voices = Q16_12, Thoughts = Q16_13),
+  .id = "Study"
+) %>%
+  mutate(Either = pmax(Voices, Thoughts))
+
+psychosis_long <- psychosis_items %>%
+  pivot_longer(c(Voices, Thoughts, Either),
+               names_to = "item", values_to = "response") %>%
+  mutate(item = factor(item, levels = c("Voices", "Thoughts", "Either")))
+
+psychosis_long %>%
+  filter(item != "Either") %>%
+  count(item, Study, response) %>%
+  group_by(item, Study) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = c(item, response),
+              names_from = Study, values_from = c(n, percent),
+              values_fill = 0) %>%
+  arrange(item, response)
+```
+
+### Endorsement rates
+
+```{r}
+psychosis_rates <- psychosis_long %>%
+  group_by(item, Study) %>%
+  summarise(
+    n = sum(!is.na(response)),
+    mild_or_more = sum(response >= 3, na.rm = TRUE),
+    pct_mild_or_more = 100 * mean(response >= 3, na.rm = TRUE),
+    moderate_or_more = sum(response >= 4, na.rm = TRUE),
+    pct_moderate_or_more = 100 * mean(response >= 4, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+psychosis_rates
+
+# Fisher's exact test of the difference in endorsement between studies.
+# Odds ratio > 1 = higher endorsement in the replication.
+psychosis_tests <- psychosis_long %>%
+  # cross_join() keeps duplicate rows; crossing() would drop them.
+  cross_join(tibble(threshold_label = c("Mild or more", "Moderate or more"),
+                    threshold = c(3, 4))) %>%
+  group_by(item, threshold_label) %>%
+  summarise(
+    p = fisher.test(table(Study, response >= threshold))$p.value,
+    odds_ratio = fisher.test(table(Study, response >= threshold))$estimate,
+    .groups = "drop"
+  )
+
+psychosis_tests
+```
+
+### Figure
+
 ```{r}
 #| fig-width: 7
-#| fig-height: 3.1
-#| fig-cap: "Panel A shows unadjusted Mini-K and DSM-5 total scores and linear fits; the focal test reported above is a partial correlation controlling for age. All panels use the same replication sample (n = 68)."
-publication_figure <- ggarrange(
+#| fig-height: 3.4
+#| fig-cap: "Percentage of respondents reporting each psychotic symptom on at least several days (Mild or more) or more than half the days (Moderate or more) in the past two weeks. Original n = 138; replication n = 68."
+psychosis_plot_data <- psychosis_rates %>%
+  select(item, Study, pct_mild_or_more, pct_moderate_or_more) %>%
+  pivot_longer(starts_with("pct_"), names_to = "threshold", values_to = "percent") %>%
+  mutate(
+    threshold = recode(threshold,
+                       pct_mild_or_more = "Several days or more",
+                       pct_moderate_or_more = "More than half the days"),
+    threshold = factor(threshold, levels = c("Several days or more",
+                                             "More than half the days")),
+    item = recode(item,
+                  Voices = "Voices\n(item 12)",
+                  Thoughts = "Thoughts heard\n(item 13)",
+                  Either = "Either")
+  )
+
+psychosis_plot <- ggplot(psychosis_plot_data,
+                         aes(x = item, y = percent, fill = Study)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7,
+           color = "black", linewidth = 0.2, alpha = 0.85) +
+  geom_text(aes(label = sprintf("%.0f%%", percent)),
+            position = position_dodge(width = 0.75), vjust = -0.4,
+            size = 3.3, family = plot_font) +
+  facet_wrap(~ threshold) +
+  scale_fill_manual(values = study_palette) +
+  scale_y_continuous(limits = c(0, 60), expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "Respondents (%)") +
+  publication_theme +
+  theme(legend.position = "top",
+        strip.background = element_blank(),
+        strip.text = element_text(size = 13))
+
+psychosis_plot
+
+ggsave("figures/hurst_psychosis_items.svg", psychosis_plot,
+       device = svglite::svglite, width = 7, height = 3.4, bg = "white")
+```
+
+# Publication figure
+
+```{r}
+#| fig-width: 7
+#| fig-height: 5.7
+#| fig-cap: "Panel A shows unadjusted Mini-K and DSM-5 total scores and linear fits; the focal test reported above is a partial correlation controlling for age. Panels D and E show the percentage of respondents reporting hearing voices (DSM-5 item 12) or feeling that others can hear their thoughts (item 13) on at least several days (D) or more than half the days (E) in the past two weeks. All panels use the same replication sample (n = 68)."
+psychosis_panel <- function(threshold_name) {
+  psychosis_plot_data %>%
+    filter(threshold == threshold_name) %>%
+    ggplot(aes(x = item, y = percent, fill = Study)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7,
+             color = "black", linewidth = 0.2, alpha = 0.85) +
+    geom_text(aes(label = sprintf("%.0f%%", percent)),
+              position = position_dodge(width = 0.75), vjust = -0.4,
+              size = 3.3, family = plot_font) +
+    scale_fill_manual(values = study_palette) +
+    # Short labels to fit the narrower panels; item numbers are in the caption.
+    scale_x_discrete(labels = c("Voices", "Thoughts\nheard", "Either")) +
+    scale_y_continuous(limits = c(0, 60), expand = expansion(mult = c(0, 0.02))) +
+    labs(title = threshold_name, x = NULL, y = "Respondents (%)") +
+    publication_theme +
+    theme(legend.position = "none", plot.margin = margin(8, 2, 2, 2))
+}
+
+publication_top <- ggarrange(
   focal_figure, aaq_figure, bpa_figure,
   ncol = 3, nrow = 1,
   common.legend = TRUE, legend = "top", legend.grob = study_legend,
@@ -352,8 +495,26 @@ publication_figure <- ggarrange(
   font.label = list(size = 15, face = "plain", family = plot_font),
   label.x = 0.01, label.y = 0.99, hjust = 0, vjust = 1
 )
+
+# Same panel width as A–C, centred with blank spacers.
+publication_bottom <- ggarrange(
+  NULL,
+  psychosis_panel("Several days or more"),
+  psychosis_panel("More than half the days"),
+  NULL,
+  ncol = 4, nrow = 1, widths = c(0.5, 1, 1, 0.5),
+  labels = c("", "D", "E", ""),
+  font.label = list(size = 15, face = "plain", family = plot_font),
+  label.x = 0.01, label.y = 0.99, hjust = 0, vjust = 1
+)
+
+# NULL row adds a small gap between the rows.
+publication_figure <- ggarrange(
+  publication_top, NULL, publication_bottom,
+  ncol = 1, nrow = 3, heights = c(3.1, 0.35, 2.25)
+)
 publication_figure
 
 ggsave("figures/hurst_three_panel.svg", publication_figure,
-       device = svglite::svglite, width = 7, height = 3.1, bg = "white")
+       device = svglite::svglite, width = 7, height = 5.7, bg = "white")
 ```
