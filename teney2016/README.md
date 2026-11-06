@@ -20,3 +20,5 @@ ZA7562_v2-0-0.sav
 ZA7576_v2-0-0.sav
 
 Follow the repo's instructions to recreate their RDS dataset. Then run `teney_updated.R` provided here.
+
+Teney's original scripts are here for reference: https://osf.io/whp4b

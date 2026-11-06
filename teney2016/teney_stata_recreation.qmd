@@ -1,0 +1,186 @@
+---
+title: "Teney (2016) Stata recreation: squared unemployment term"
+date: 2026-11-05
+format:
+  html:
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  comment: ""
+---
+
+```{r setup}
+suppressMessages(library(lme4))
+out <- "stata_recreation_output"
+if (!file.exists(file.path(out, "eb_stata_recreation.rds"))) source("teney_stata_recreation.R")
+eb <- readRDS(file.path(out, "eb_stata_recreation.rds"))
+eb$wave_f <- factor(eb$eb)
+
+show_model <- function(f) {
+  m <- lmer(as.formula(f), data = eb, REML = FALSE)
+  cat(f, "\n\n")
+  cat(sprintf("N = %d", nobs(m)), paste0(names(ngrps(m)), " = ", ngrps(m), collapse = ", "), "\n\n")
+  vc <- as.data.frame(VarCorr(m))
+  print(data.frame(group = vc$grp, sd = round(vc$sdcor, 4)), row.names = FALSE)
+  s <- summary(m)$coefficients
+  cat("\n")
+  print(data.frame(b = round(s[, 1], 5), se = round(s[, 2], 5), z = round(s[, 3], 2),
+                   p = signif(2 * pnorm(-abs(s[, 3])), 2)))
+}
+
+fx <- "cos ~ female + mage + edu3 + ses + urban + mgrowth + munemp + mgrowth:edu3 + munemp:edu3"
+```
+
+All models below use the data built by `teney_stata_recreation.R`: EB 80.1–91.5 (2013–2019), coded as in Teney's Stata files (`original_script/eb_all.do`, `original_script/eb_ml_ESR.do`), fitted by maximum likelihood without weights. The focal coefficient is `munemp`, the unemployment slope for the low-educated at the grand mean. In 2004–2013 it was b = −0.00340, t = −4.03.
+
+# Code conversion: Teney (Stata) → ours (R)
+
+### Outcome
+
+The outcome is the share of mentioned items that are cosmopolitan; "Euro" is left out of the denominator.
+
+Teney (Stata):
+
+```stata
+gen sumeu=peace+eco_pros+demo+soc_prot+trav+div+say+unemp+bur+waste+loss_id+crime+border
+gen cos=(peace/sumeu)+(demo/sumeu)+(trav/sumeu)+(div/sumeu)+(say/sumeu)
+```
+
+Ours (R):
+
+```r
+sumeu = peace + eco_pros + demo + soc_prot + trav + div + say + unemp +
+        bur + waste + loss_id + crime + border
+cos = (peace + demo + trav + div + say) / sumeu
+# x/0 -> NA, as Stata returns missing
+```
+
+For comparison, the replication (`teney.R`) instead takes the mean of the five cosmopolitan dummies, i.e. count ÷ 5:
+
+```r
+mutate(cosmo = rowMeans(.[, c('qa12_1', 'qa12_3', 'qa12_5', 'qa12_6', 'qa12_7')], na.rm = TRUE))
+```
+
+### Education
+
+Students get their current age, and "no full-time education" is set to missing. Stata ranks missing above every number, so `edu>19` also puts missing education in the high group. The R script copies this by default (`STATA_MISSING_EDU_IS_HIGH`).
+
+Teney (Stata):
+
+```stata
+replace edu=age if edu==98
+replace edu=. if edu==97
+replace edu3=1 if edu<16
+replace edu3=2 if edu==16|edu==17|edu==18|edu==19
+replace edu3=3 if edu>19
+```
+
+Ours (R):
+
+```r
+edu[edu %in% 98] <- age[edu %in% 98]
+edu[edu %in% 97] <- NA
+edu3[edu < 16]              <- 1
+edu3[edu >= 16 & edu <= 19] <- 2
+edu3[edu > 19]              <- 3
+if (STATA_MISSING_EDU_IS_HIGH) edu3[is.na(edu)] <- 3
+```
+
+### Grand-mean centring
+
+Teney hard-coded the means of her own sample. The R script uses the means of the new sample.
+
+Teney (Stata):
+
+```stata
+gen munemp=unemp_rate-8.76
+gen mgrowth=growth-1.41
+gen mage=age-48
+```
+
+Ours (R):
+
+```r
+munemp  <- unemp_rate - mean(unemp_rate)
+mgrowth <- growth     - mean(growth)
+mage    <- age        - mean(age)
+```
+
+### Model and random effects
+
+Teney's level 2 is the country-wave (`eb_ctr`), nested within country.
+
+Teney (Stata):
+
+```stata
+mixed cos female mage i.edu3 b4.ses b3.urban mgrowth munemp c.mgrowth##edu3 c.munemp##edu3
+  || cty: || eb_ctr: if eb!=203 & eb!=303 & eb!=906, covariance(unstructured)
+```
+
+Ours (R):
+
+```r
+lmer(cos ~ female + mage + edu3 + ses + urban + mgrowth + munemp +
+       mgrowth:edu3 + munemp:edu3 + (1 | cty_f) + (1 | eb_ctr_f),
+     data = eb, REML = FALSE)
+# ses ref = manual workers, urban ref = large town
+```
+
+The replication has no country-wave level. It fits crossed wave and country intercepts, uses uncentred unemployment and GDP, adds both squared terms, and weights the data:
+
+```r
+lmer(cosmo ~ 1 + d11 + d10 + d8r2 + relevel(d25, ref = "3") +
+       relevel(d15a_r2, ref = "4") + UNEMPL + I(UNEMPL^2) + GDP + I(GDP^2) +
+       d8r2*GDP + d8r2*UNEMPL + (1 | wave1) + (1 | country),
+     data = final.merge4, REML = FALSE, weights = w1)
+```
+
+Unemployment and growth vary only between country-waves (378 of them), not between respondents. Without a country-wave intercept, the model treats every respondent as a separate observation of those macro variables, so their standard errors are too small. Model 4 below shows what this does to the squared term.
+
+**Data.** Croatia is not in Teney's country list, so it is dropped. Her country-level file (`var_cty.dta`) is not available, so unemployment and real GDP growth are Eurostat annual values (`une_rt_a`, `tec00115`) for the survey year.
+
+# Models
+
+## 1. Teney's model (Table 3, cosmopolitan)
+
+Random intercepts for country and for country-wave nested within country.
+
+```{r}
+show_model(paste(fx, "+ (1 | cty_f) + (1 | eb_ctr_f)"))
+```
+
+## 2. With a squared unemployment term, run as decribed in Teney's paper
+
+Same random effects as model 1.
+
+```{r}
+show_model(paste(fx, "+ I(munemp^2) + (1 | cty_f) + (1 | eb_ctr_f)"))
+```
+
+## 3. Teney's procedure: keep only the significant squared terms
+
+Teney added squared terms for the macro variables and kept only the significant ones. Her `eb_ml_ESR.do` note says that for the cosmopolitan frame they were "ns", so she kept none. The 2013–2019 data have two macro variables, unemployment and growth. Step 1 adds both squared terms to model 1:
+
+```{r}
+m_both <- lmer(as.formula(paste(fx, "+ I(munemp^2) + I(mgrowth^2) + (1 | cty_f) + (1 | eb_ctr_f)")),
+               data = eb, REML = FALSE)
+s <- summary(m_both)$coefficients[c("I(munemp^2)", "I(mgrowth^2)"), ]
+print(data.frame(b = round(s[, 1], 5), se = round(s[, 2], 5), z = round(s[, 3], 2),
+                 p = signif(2 * pnorm(-abs(s[, 3])), 2)))
+```
+
+Step 2 drops the non-significant squared term (unemployment), keeps squared growth, and refits:
+
+```{r}
+show_model(paste(fx, "+ I(mgrowth^2) + (1 | cty_f) + (1 | eb_ctr_f)"))
+```
+
+## 4. With the squared term and the replication's random effects
+
+Crossed random intercepts for wave and country, with no country-wave level. This is the replication's random-effects structure, applied to Teney's coding.
+
+```{r}
+show_model(paste(fx, "+ I(munemp^2) + (1 | wave_f) + (1 | cty_f)"))
+```
